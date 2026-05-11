@@ -2,10 +2,13 @@
 set -Eeuo pipefail
 
 APP_NAME="Docker迁移一键通"
-VERSION="1.0.0"
+VERSION="1.1.0"
 HELPER_IMAGE="${HELPER_IMAGE:-alpine:3.20}"
 WORK_ROOT="${WORK_ROOT:-/tmp/docker-migrate-cn}"
 DEFAULT_PORT="${PORT:-8088}"
+WEB_PORT="${WEB_PORT:-8090}"
+AUTO_STOP_MODE="${AUTO_STOP_MODE:-ask}"
+RAW_SCRIPT_URL="https://raw.githubusercontent.com/yeah1z1/docker-migrate-oneclick/main/docker-migrate.sh"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -504,11 +507,21 @@ backup_bundle() {
 
   STOPPED_FILE="$bundle/stopped_containers.txt"
   : > "$STOPPED_FILE"
-  if ask_yes_no "是否临时停止选中的运行容器以保证数据一致性？" "Y"; then
-    stop_selected_containers "$STOPPED_FILE" "${SELECTED_CONTAINERS[@]}"
-  else
-    warn "未停止容器，数据库类服务建议自行做业务备份"
-  fi
+  case "$AUTO_STOP_MODE" in
+    yes)
+      stop_selected_containers "$STOPPED_FILE" "${SELECTED_CONTAINERS[@]}"
+      ;;
+    no)
+      warn "未停止容器，数据库类服务建议自行做业务备份"
+      ;;
+    *)
+      if ask_yes_no "是否临时停止选中的运行容器以保证数据一致性？" "Y"; then
+        stop_selected_containers "$STOPPED_FILE" "${SELECTED_CONTAINERS[@]}"
+      else
+        warn "未停止容器，数据库类服务建议自行做业务备份"
+      fi
+      ;;
+  esac
 
   local images_file="$bundle/images.list"
   : > "$images_file"
@@ -609,11 +622,627 @@ serve_archive() {
   title "新机器恢复命令"
   local url="http://$(local_ip):$port/$(basename "$archive")"
   printf "在新机器执行：\n\n"
-  printf "bash <(curl -fsSL https://raw.githubusercontent.com/yeah1z1/docker-migrate-oneclick/main/docker-migrate.sh)\n\n"
+  printf "bash <(curl -fsSL %s)\n\n" "$RAW_SCRIPT_URL"
   printf "然后选择：2) 新机器：输入链接下载并恢复\n"
   printf "迁移包链接：%s\n\n" "$url"
   warn "保持本窗口不要关闭；新机器恢复完成后按 Ctrl+C 结束分享"
   python3 -m http.server "$port" --bind 0.0.0.0 --directory "$dir"
+}
+
+start_web_console() {
+  ensure_deps
+  mkdir -p "$WORK_ROOT"
+
+  local saved_script web_app web_token
+  saved_script="$WORK_ROOT/docker-migrate.sh"
+  web_app="$WORK_ROOT/web-console.py"
+
+  if [[ -r "${BASH_SOURCE[0]}" ]]; then
+    cp "${BASH_SOURCE[0]}" "$saved_script"
+  else
+    curl -fsSL "$RAW_SCRIPT_URL" -o "$saved_script"
+  fi
+  chmod +x "$saved_script"
+
+  web_token="${WEB_TOKEN:-$(python3 - <<'PY'
+import secrets
+print(secrets.token_urlsafe(18))
+PY
+)}"
+
+  cat > "$web_app" <<'PYWEB_EOF'
+#!/usr/bin/env python3
+import html
+import json
+import mimetypes
+import os
+import re
+import subprocess
+import time
+import urllib.parse
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+
+
+APP_NAME = "Docker迁移一键通"
+SCRIPT = os.environ["DOCKER_MIGRATE_SCRIPT"]
+WORK_ROOT = Path(os.environ.get("WORK_ROOT", "/tmp/docker-migrate-cn")).resolve()
+TOKEN = os.environ["WEB_TOKEN"]
+RAW_SCRIPT_URL = os.environ.get("RAW_SCRIPT_URL", "")
+
+
+def run(cmd, timeout=None, env=None):
+    merged_env = os.environ.copy()
+    if env:
+        merged_env.update(env)
+    return subprocess.run(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=timeout,
+        env=merged_env,
+        check=False,
+    )
+
+
+def json_response(handler, data, status=200):
+    body = json.dumps(data, ensure_ascii=False).encode("utf-8")
+    handler.send_response(status)
+    handler.send_header("Content-Type", "application/json; charset=utf-8")
+    handler.send_header("Content-Length", str(len(body)))
+    handler.end_headers()
+    handler.wfile.write(body)
+
+
+def text_response(handler, body, status=200, content_type="text/html; charset=utf-8"):
+    body_bytes = body.encode("utf-8")
+    handler.send_response(status)
+    handler.send_header("Content-Type", content_type)
+    handler.send_header("Content-Length", str(len(body_bytes)))
+    handler.end_headers()
+    handler.wfile.write(body_bytes)
+
+
+def parse_query(path):
+    parsed = urllib.parse.urlparse(path)
+    return parsed, urllib.parse.parse_qs(parsed.query)
+
+
+def authorized(handler, query):
+    header_token = handler.headers.get("X-Token", "")
+    query_token = query.get("token", [""])[0]
+    return TOKEN and (header_token == TOKEN or query_token == TOKEN)
+
+
+def read_json(handler):
+    length = int(handler.headers.get("Content-Length", "0") or "0")
+    if length <= 0:
+        return {}
+    raw = handler.rfile.read(length)
+    return json.loads(raw.decode("utf-8"))
+
+
+def docker_json_lines(cmd):
+    proc = run(cmd, timeout=60)
+    if proc.returncode != 0:
+        raise RuntimeError(proc.stdout.strip() or "Docker 命令执行失败")
+    rows = []
+    for line in proc.stdout.splitlines():
+        line = line.strip()
+        if line:
+            rows.append(json.loads(line))
+    return rows
+
+
+def container_details():
+    rows = docker_json_lines(["docker", "ps", "-a", "--format", "{{json .}}"])
+    names = [row.get("Names", "") for row in rows if row.get("Names")]
+    inspect_map = {}
+    if names:
+        proc = run(["docker", "inspect", *names], timeout=90)
+        if proc.returncode == 0 and proc.stdout.strip():
+            for item in json.loads(proc.stdout):
+                inspect_map[item.get("Name", "").lstrip("/")] = item
+
+    result = []
+    for row in rows:
+        name = row.get("Names", "")
+        info = inspect_map.get(name, {})
+        mounts = info.get("Mounts") or []
+        networks = sorted(((info.get("NetworkSettings") or {}).get("Networks") or {}).keys())
+        ports = row.get("Ports") or ""
+        result.append(
+            {
+                "name": name,
+                "image": row.get("Image") or (info.get("Config") or {}).get("Image", ""),
+                "status": row.get("Status", ""),
+                "running": bool((info.get("State") or {}).get("Running")),
+                "ports": ports,
+                "volumes": [m.get("Name") for m in mounts if m.get("Type") == "volume" and m.get("Name")],
+                "binds": [m.get("Source") for m in mounts if m.get("Type") == "bind" and m.get("Source")],
+                "networks": networks,
+                "created": row.get("CreatedAt", ""),
+            }
+        )
+    return result
+
+
+def newest_archive():
+    archives = sorted(WORK_ROOT.glob("docker_migrate_*.tar.gz"), key=lambda p: p.stat().st_mtime, reverse=True)
+    return archives[0] if archives else None
+
+
+def parse_archive_path(output):
+    matches = re.findall(r"(?:备份完成|生成迁移包)[：:]\s*(/[^\r\n]+?\.tar\.gz)", output)
+    if matches:
+        return Path(matches[-1]).resolve()
+    return newest_archive()
+
+
+def safe_archive_path(filename):
+    candidate = (WORK_ROOT / filename).resolve()
+    if WORK_ROOT not in candidate.parents and candidate != WORK_ROOT:
+        raise ValueError("非法文件路径")
+    if not candidate.is_file():
+        raise FileNotFoundError(filename)
+    return candidate
+
+
+def page_html():
+    raw_url = html.escape(RAW_SCRIPT_URL)
+    return f"""<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{APP_NAME}</title>
+  <style>
+    :root {{
+      --bg: #f6f7f9;
+      --panel: #ffffff;
+      --text: #17202a;
+      --muted: #667085;
+      --line: #d9dee7;
+      --accent: #0f766e;
+      --accent-dark: #0b5f59;
+      --danger: #b42318;
+      --shadow: 0 10px 24px rgba(20, 31, 43, .08);
+    }}
+    * {{ box-sizing: border-box; }}
+    body {{
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei", sans-serif;
+      font-size: 14px;
+    }}
+    header {{
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+      padding: 18px 24px;
+      border-bottom: 1px solid var(--line);
+      background: var(--panel);
+      position: sticky;
+      top: 0;
+      z-index: 2;
+    }}
+    h1 {{ margin: 0; font-size: 20px; font-weight: 700; letter-spacing: 0; }}
+    main {{ padding: 20px 24px 32px; max-width: 1280px; margin: 0 auto; }}
+    .toolbar, .restore, .result {{
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      box-shadow: var(--shadow);
+      padding: 14px;
+      margin-bottom: 14px;
+    }}
+    .toolbar {{
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 10px;
+    }}
+    button, input[type="text"] {{
+      height: 36px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      padding: 0 12px;
+      font: inherit;
+      background: #fff;
+      color: var(--text);
+    }}
+    button {{
+      cursor: pointer;
+      font-weight: 600;
+    }}
+    button.primary {{
+      background: var(--accent);
+      color: #fff;
+      border-color: var(--accent);
+    }}
+    button.primary:hover {{ background: var(--accent-dark); }}
+    button:disabled {{ opacity: .55; cursor: not-allowed; }}
+    label.inline {{
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      color: var(--muted);
+      white-space: nowrap;
+    }}
+    .count {{ color: var(--muted); margin-left: auto; }}
+    table {{
+      width: 100%;
+      border-collapse: collapse;
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      overflow: hidden;
+      box-shadow: var(--shadow);
+    }}
+    th, td {{
+      padding: 11px 10px;
+      border-bottom: 1px solid var(--line);
+      text-align: left;
+      vertical-align: top;
+    }}
+    th {{
+      background: #eef2f6;
+      font-size: 12px;
+      color: #344054;
+      text-transform: uppercase;
+    }}
+    tr:last-child td {{ border-bottom: 0; }}
+    .name {{ font-weight: 700; }}
+    .muted {{ color: var(--muted); }}
+    .badge {{
+      display: inline-block;
+      min-width: 48px;
+      padding: 3px 8px;
+      border-radius: 999px;
+      font-size: 12px;
+      font-weight: 700;
+      text-align: center;
+      background: #e7f6ef;
+      color: #067647;
+    }}
+    .badge.off {{ background: #f2f4f7; color: #667085; }}
+    .chips {{ display: flex; flex-wrap: wrap; gap: 4px; }}
+    .chip {{
+      border: 1px solid #cfd6df;
+      background: #f9fafb;
+      color: #344054;
+      border-radius: 999px;
+      padding: 2px 7px;
+      font-size: 12px;
+      max-width: 240px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }}
+    .restore {{
+      display: grid;
+      grid-template-columns: 1fr auto;
+      gap: 10px;
+    }}
+    .restore h2, .result h2 {{ grid-column: 1 / -1; margin: 0 0 2px; font-size: 16px; }}
+    .result[hidden] {{ display: none; }}
+    pre {{
+      max-height: 260px;
+      overflow: auto;
+      margin: 10px 0 0;
+      padding: 12px;
+      border-radius: 6px;
+      background: #111827;
+      color: #d1d5db;
+      white-space: pre-wrap;
+    }}
+    a.download {{
+      display: inline-flex;
+      align-items: center;
+      height: 36px;
+      padding: 0 12px;
+      border-radius: 6px;
+      background: var(--accent);
+      color: #fff;
+      text-decoration: none;
+      font-weight: 700;
+    }}
+    .error {{ color: var(--danger); font-weight: 700; }}
+    @media (max-width: 760px) {{
+      header {{ align-items: flex-start; flex-direction: column; }}
+      main {{ padding: 14px; }}
+      .count {{ margin-left: 0; width: 100%; }}
+      .restore {{ grid-template-columns: 1fr; }}
+      table, thead, tbody, th, td, tr {{ display: block; }}
+      thead {{ display: none; }}
+      tr {{ border-bottom: 1px solid var(--line); padding: 10px; }}
+      td {{ border-bottom: 0; padding: 5px 0; }}
+      td::before {{ content: attr(data-label); display: block; color: var(--muted); font-size: 12px; }}
+    }}
+  </style>
+</head>
+<body>
+  <header>
+    <div>
+      <h1>{APP_NAME}</h1>
+      <div class="muted">可视化选择容器，生成迁移包下载链接</div>
+    </div>
+    <div class="muted">新机器命令：bash &lt;(curl -fsSL {raw_url})</div>
+  </header>
+  <main>
+    <section class="toolbar">
+      <button id="refreshBtn">刷新</button>
+      <button id="selectAllBtn">全选</button>
+      <button id="runningBtn">只选运行中</button>
+      <label class="inline"><input id="stopBox" type="checkbox" checked> 备份前临时停止运行容器</label>
+      <button class="primary" id="backupBtn">生成迁移包</button>
+      <span class="count" id="countText">正在读取容器...</span>
+    </section>
+
+    <table>
+      <thead>
+        <tr>
+          <th style="width:44px"></th>
+          <th>容器</th>
+          <th>镜像</th>
+          <th>状态</th>
+          <th>端口</th>
+          <th>数据</th>
+          <th>网络</th>
+        </tr>
+      </thead>
+      <tbody id="containerBody"></tbody>
+    </table>
+
+    <section class="restore">
+      <h2>新机器恢复</h2>
+      <input id="restoreUrl" type="text" placeholder="粘贴老机器生成的迁移包链接">
+      <button id="restoreBtn">下载并恢复</button>
+    </section>
+
+    <section id="result" class="result" hidden>
+      <h2 id="resultTitle">执行结果</h2>
+      <div id="resultBody"></div>
+      <pre id="logBox"></pre>
+    </section>
+  </main>
+  <script>
+    const TOKEN = new URLSearchParams(location.search).get('token') || '';
+    let containers = [];
+
+    function esc(value) {{
+      return String(value ?? '').replace(/[&<>"']/g, c => ({{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}}[c]));
+    }}
+    function chips(items) {{
+      if (!items || !items.length) return '<span class="muted">无</span>';
+      return '<div class="chips">' + items.map(x => `<span class="chip" title="${{esc(x)}}">${{esc(x)}}</span>`).join('') + '</div>';
+    }}
+    async function api(path, options = {{}}) {{
+      const headers = Object.assign({{'X-Token': TOKEN}}, options.headers || {{}});
+      if (options.body && !headers['Content-Type']) headers['Content-Type'] = 'application/json';
+      const res = await fetch(path + (path.includes('?') ? '&' : '?') + 'token=' + encodeURIComponent(TOKEN), Object.assign({{}}, options, {{headers}}));
+      const data = await res.json().catch(() => ({{error: '响应格式错误'}}));
+      if (!res.ok) throw new Error(data.error || '请求失败');
+      return data;
+    }}
+    function selectedNames() {{
+      return Array.from(document.querySelectorAll('.rowCheck:checked')).map(x => x.value);
+    }}
+    function updateCount() {{
+      document.getElementById('countText').textContent = `已选 ${{selectedNames().length}} / ${{containers.length}} 个容器`;
+    }}
+    function render() {{
+      const body = document.getElementById('containerBody');
+      body.innerHTML = containers.map(c => `
+        <tr>
+          <td data-label="选择"><input class="rowCheck" type="checkbox" value="${{esc(c.name)}}"></td>
+          <td data-label="容器"><div class="name">${{esc(c.name)}}</div><div class="muted">${{esc(c.created || '')}}</div></td>
+          <td data-label="镜像">${{esc(c.image)}}</td>
+          <td data-label="状态"><span class="badge ${{c.running ? '' : 'off'}}">${{c.running ? '运行中' : '已停止'}}</span><div class="muted">${{esc(c.status)}}</div></td>
+          <td data-label="端口">${{esc(c.ports || '无')}}</td>
+          <td data-label="数据">${{chips([...(c.volumes || []), ...(c.binds || [])])}}</td>
+          <td data-label="网络">${{chips(c.networks || [])}}</td>
+        </tr>
+      `).join('');
+      document.querySelectorAll('.rowCheck').forEach(x => x.addEventListener('change', updateCount));
+      updateCount();
+    }}
+    async function loadContainers() {{
+      document.getElementById('countText').textContent = '正在读取容器...';
+      containers = (await api('/api/containers')).containers;
+      render();
+    }}
+    function showResult(title, body, log = '') {{
+      document.getElementById('result').hidden = false;
+      document.getElementById('resultTitle').textContent = title;
+      document.getElementById('resultBody').innerHTML = body;
+      document.getElementById('logBox').textContent = log;
+      document.getElementById('result').scrollIntoView({{behavior: 'smooth', block: 'start'}});
+    }}
+    document.getElementById('refreshBtn').onclick = loadContainers;
+    document.getElementById('selectAllBtn').onclick = () => {{
+      const checks = Array.from(document.querySelectorAll('.rowCheck'));
+      const shouldCheck = checks.some(x => !x.checked);
+      checks.forEach(x => x.checked = shouldCheck);
+      updateCount();
+    }};
+    document.getElementById('runningBtn').onclick = () => {{
+      const running = new Set(containers.filter(x => x.running).map(x => x.name));
+      document.querySelectorAll('.rowCheck').forEach(x => x.checked = running.has(x.value));
+      updateCount();
+    }};
+    document.getElementById('backupBtn').onclick = async () => {{
+      const names = selectedNames();
+      if (!names.length) return showResult('请选择容器', '<div class="error">至少选择一个容器。</div>');
+      const btn = document.getElementById('backupBtn');
+      btn.disabled = true;
+      btn.textContent = '生成中...';
+      try {{
+        const data = await api('/api/backup', {{
+          method: 'POST',
+          body: JSON.stringify({{containers: names, stop: document.getElementById('stopBox').checked}})
+        }});
+        showResult('迁移包已生成', `<a class="download" href="${{esc(data.download_url)}}">下载迁移包</a><p>新机器可粘贴这个链接恢复：</p><p><code>${{esc(data.download_url)}}</code></p>`, data.output || '');
+      }} catch (err) {{
+        showResult('生成失败', `<div class="error">${{esc(err.message)}}</div>`);
+      }} finally {{
+        btn.disabled = false;
+        btn.textContent = '生成迁移包';
+      }}
+    }};
+    document.getElementById('restoreBtn').onclick = async () => {{
+      const url = document.getElementById('restoreUrl').value.trim();
+      if (!url) return showResult('请输入链接', '<div class="error">迁移包链接不能为空。</div>');
+      const btn = document.getElementById('restoreBtn');
+      btn.disabled = true;
+      btn.textContent = '恢复中...';
+      try {{
+        const data = await api('/api/restore', {{method: 'POST', body: JSON.stringify({{url}})}});
+        showResult('恢复完成', '<p>迁移包已下载并恢复。</p>', data.output || '');
+        loadContainers();
+      }} catch (err) {{
+        showResult('恢复失败', `<div class="error">${{esc(err.message)}}</div>`);
+      }} finally {{
+        btn.disabled = false;
+        btn.textContent = '下载并恢复';
+      }}
+    }};
+    loadContainers().catch(err => showResult('读取失败', `<div class="error">${{esc(err.message)}}</div>`));
+  </script>
+</body>
+</html>"""
+
+
+class Handler(BaseHTTPRequestHandler):
+    server_version = "DockerMigrateWeb/1.1"
+
+    def log_message(self, fmt, *args):
+        print("%s - %s" % (self.address_string(), fmt % args))
+
+    def do_GET(self):
+        parsed, query = parse_query(self.path)
+        if parsed.path == "/":
+            text_response(self, page_html())
+            return
+        if parsed.path == "/api/containers":
+            if not authorized(self, query):
+                json_response(self, {"error": "未授权"}, 403)
+                return
+            try:
+                json_response(self, {"containers": container_details()})
+            except Exception as exc:
+                json_response(self, {"error": str(exc)}, 500)
+            return
+        if parsed.path.startswith("/download/"):
+            if not authorized(self, query):
+                text_response(self, "未授权", 403, "text/plain; charset=utf-8")
+                return
+            filename = urllib.parse.unquote(parsed.path.rsplit("/", 1)[-1])
+            try:
+                path = safe_archive_path(filename)
+            except Exception as exc:
+                text_response(self, str(exc), 404, "text/plain; charset=utf-8")
+                return
+            ctype = mimetypes.guess_type(path.name)[0] or "application/gzip"
+            self.send_response(200)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(path.stat().st_size))
+            self.send_header("Content-Disposition", f'attachment; filename="{path.name}"')
+            self.end_headers()
+            with path.open("rb") as fh:
+                while True:
+                    chunk = fh.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+            return
+        json_response(self, {"error": "Not found"}, 404)
+
+    def do_POST(self):
+        parsed, query = parse_query(self.path)
+        if not authorized(self, query):
+            json_response(self, {"error": "未授权"}, 403)
+            return
+        try:
+            data = read_json(self)
+        except Exception:
+            json_response(self, {"error": "JSON 格式错误"}, 400)
+            return
+
+        if parsed.path == "/api/backup":
+            containers = data.get("containers") or []
+            containers = [str(x).strip() for x in containers if str(x).strip()]
+            if not containers:
+                json_response(self, {"error": "请选择至少一个容器"}, 400)
+                return
+            stop_flag = "--yes-stop" if data.get("stop", True) else "--no-stop"
+            env = {"WORK_ROOT": str(WORK_ROOT)}
+            cmd = ["bash", SCRIPT, "--backup-local", "--containers", ",".join(containers), stop_flag]
+            proc = run(cmd, timeout=None, env=env)
+            archive = parse_archive_path(proc.stdout)
+            if proc.returncode != 0 or not archive or not archive.exists():
+                json_response(self, {"error": "生成迁移包失败", "output": proc.stdout}, 500)
+                return
+            host = self.headers.get("Host", f"127.0.0.1:{self.server.server_port}")
+            quoted = urllib.parse.quote(archive.name)
+            download_url = f"http://{host}/download/{quoted}?token={urllib.parse.quote(TOKEN)}"
+            json_response(
+                self,
+                {
+                    "archive": str(archive),
+                    "download_url": download_url,
+                    "output": proc.stdout,
+                },
+            )
+            return
+
+        if parsed.path == "/api/restore":
+            url = str(data.get("url") or "").strip()
+            if not url:
+                json_response(self, {"error": "迁移包链接不能为空"}, 400)
+                return
+            cmd = ["bash", SCRIPT, "--restore", url]
+            proc = run(cmd, timeout=None, env={"WORK_ROOT": str(WORK_ROOT)})
+            status = 200 if proc.returncode == 0 else 500
+            payload = {"output": proc.stdout}
+            if proc.returncode != 0:
+                payload["error"] = "恢复失败"
+            json_response(self, payload, status)
+            return
+
+        json_response(self, {"error": "Not found"}, 404)
+
+
+def main():
+    WORK_ROOT.mkdir(parents=True, exist_ok=True)
+    port = int(os.environ.get("WEB_PORT", "8090"))
+    server = ThreadingHTTPServer(("0.0.0.0", port), Handler)
+    print(f"{APP_NAME} 网页控制台已启动")
+    print(f"访问地址：http://127.0.0.1:{port}/?token={TOKEN}")
+    print("局域网访问请把 127.0.0.1 换成服务器 IP")
+    server.serve_forever()
+
+
+if __name__ == "__main__":
+    main()
+PYWEB_EOF
+
+  export DOCKER_MIGRATE_SCRIPT="$saved_script"
+  export WORK_ROOT
+  export WEB_PORT
+  export WEB_TOKEN="$web_token"
+  export RAW_SCRIPT_URL
+
+  title "网页控制台"
+  printf "本机访问：http://127.0.0.1:%s/?token=%s\n" "$WEB_PORT" "$web_token"
+  printf "局域网访问：http://%s:%s/?token=%s\n" "$(local_ip)" "$WEB_PORT" "$web_token"
+  warn "网页可以执行 Docker 迁移操作，请不要暴露到公网；按 Ctrl+C 结束"
+  python3 "$web_app"
 }
 
 restore_from_archive() {
@@ -643,22 +1272,24 @@ download_and_restore() {
 
 main_menu() {
   title "$APP_NAME v$VERSION"
-  printf "1) 老机器：备份并生成下载链接\n"
-  printf "2) 新机器：输入链接下载并恢复\n"
-  printf "3) 只备份到本地文件\n"
-  printf "4) 从本地迁移包恢复\n"
-  printf "5) 退出\n"
+  printf "1) 打开可视化网页控制台\n"
+  printf "2) 老机器：备份并生成下载链接\n"
+  printf "3) 新机器：输入链接下载并恢复\n"
+  printf "4) 只备份到本地文件\n"
+  printf "5) 从本地迁移包恢复\n"
+  printf "6) 退出\n"
   local choice archive
-  read -r -p "请选择 [1-5]：" choice
+  read -r -p "请选择 [1-6]：" choice
   case "${choice:-}" in
-    1) backup_bundle "" "" "yes" ;;
-    2) download_and_restore ;;
-    3) backup_bundle "" "" "no" ;;
-    4)
+    1) start_web_console ;;
+    2) backup_bundle "" "" "yes" ;;
+    3) download_and_restore ;;
+    4) backup_bundle "" "" "no" ;;
+    5)
       read -r -p "请输入本地迁移包路径：" archive
       restore_from_archive "$archive"
       ;;
-    5) exit 0 ;;
+    6) exit 0 ;;
     *) die "无效选择" ;;
   esac
 }
@@ -669,15 +1300,19 @@ $APP_NAME v$VERSION
 
 用法：
   bash docker-migrate.sh                  # 打开中文菜单
+  bash docker-migrate.sh --web            # 打开可视化网页控制台
   bash docker-migrate.sh --backup-link    # 老机器备份并生成下载链接
   bash docker-migrate.sh --backup-local   # 只备份到本地
   bash docker-migrate.sh --restore URL    # 新机器下载并恢复
   bash docker-migrate.sh --restore-file FILE
   bash docker-migrate.sh --all            # 配合备份命令，全量迁移
   bash docker-migrate.sh --containers a,b # 配合备份命令，指定容器
+  bash docker-migrate.sh --yes-stop       # 备份前自动停止运行容器
+  bash docker-migrate.sh --no-stop        # 备份前不停止容器
 
 环境变量：
-  PORT=8088                 分享迁移包的端口
+  PORT=8088                 命令行分享迁移包的端口
+  WEB_PORT=8090             网页控制台端口
   HELPER_IMAGE=alpine:3.20  数据卷打包辅助镜像
 EOF
 }
@@ -686,12 +1321,15 @@ main() {
   local action="" mode="" containers="" restore_url="" restore_file=""
   while (($#)); do
     case "$1" in
+      --web) action="web" ;;
       --backup-link) action="backup-link" ;;
       --backup-local) action="backup-local" ;;
       --restore) action="restore-url"; restore_url="${2:-}"; shift ;;
       --restore-file) action="restore-file"; restore_file="${2:-}"; shift ;;
       --all) mode="all" ;;
       --containers) containers="${2:-}"; shift ;;
+      --yes-stop) AUTO_STOP_MODE="yes" ;;
+      --no-stop) AUTO_STOP_MODE="no" ;;
       -h|--help) usage; exit 0 ;;
       -v|--version) echo "$VERSION"; exit 0 ;;
       *) die "未知参数：$1" ;;
@@ -700,6 +1338,7 @@ main() {
   done
 
   case "$action" in
+    web) start_web_console ;;
     backup-link) backup_bundle "$mode" "$containers" "yes" ;;
     backup-local) backup_bundle "$mode" "$containers" "no" ;;
     restore-url)

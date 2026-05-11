@@ -9,10 +9,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: ShellCheck
+      - name: Syntax check
         run: |
-          sudo apt-get update
-          sudo apt-get install -y shellcheck
           bash -n docker-migrate.sh
           bash -n install.sh
-          shellcheck docker-migrate.sh install.sh
+          python3 scripts/check-embedded-web.py

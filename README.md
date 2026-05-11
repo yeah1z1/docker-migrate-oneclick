@@ -13,12 +13,38 @@ bash <(curl -fsSL https://raw.githubusercontent.com/yeah1z1/docker-migrate-onecl
 运行后出现中文菜单：
 
 ```text
-1) 老机器：备份并生成下载链接
-2) 新机器：输入链接下载并恢复
-3) 只备份到本地文件
-4) 从本地迁移包恢复
-5) 退出
+1) 打开可视化网页控制台
+2) 老机器：备份并生成下载链接
+3) 新机器：输入链接下载并恢复
+4) 只备份到本地文件
+5) 从本地迁移包恢复
+6) 退出
 ```
+
+## 可视化网页
+
+老机器启动网页控制台：
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/yeah1z1/docker-migrate-oneclick/main/docker-migrate.sh) --web
+```
+
+脚本会输出类似下面的访问地址：
+
+```text
+本机访问：http://127.0.0.1:8090/?token=xxxx
+局域网访问：http://OLD_SERVER_IP:8090/?token=xxxx
+```
+
+在网页里可以：
+
+- 查看所有 Docker 容器、镜像、端口、数据卷、挂载目录、网络
+- 勾选要迁移的容器
+- 选择是否在备份前临时停止运行容器
+- 一键生成迁移包下载链接
+- 在新机器网页里粘贴迁移包链接并恢复
+
+网页地址会带一次性 `token`，不要把网页控制台暴露到公网。
 
 ## 典型流程
 
@@ -28,7 +54,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/yeah1z1/docker-migrate-onecl
 bash <(curl -fsSL https://raw.githubusercontent.com/yeah1z1/docker-migrate-oneclick/main/docker-migrate.sh)
 ```
 
-选择 `1) 老机器：备份并生成下载链接`，然后选择全部容器或按编号选择容器。脚本会输出一个迁移包链接。
+选择 `1) 打开可视化网页控制台`，在网页勾选要迁移的容器并生成迁移包链接。
 
 新机器执行同一条命令：
 
@@ -36,7 +62,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/yeah1z1/docker-migrate-onecl
 bash <(curl -fsSL https://raw.githubusercontent.com/yeah1z1/docker-migrate-oneclick/main/docker-migrate.sh)
 ```
 
-选择 `2) 新机器：输入链接下载并恢复`，粘贴老机器生成的链接即可。
+可以选择 `1) 打开可视化网页控制台`，在网页里粘贴老机器生成的链接恢复；也可以选择 `3) 新机器：输入链接下载并恢复`。
 
 ## 非交互用法
 
@@ -62,6 +88,12 @@ bash <(curl -fsSL https://raw.githubusercontent.com/yeah1z1/docker-migrate-onecl
 
 ```bash
 bash docker-migrate.sh --backup-local --all
+```
+
+启动网页控制台并指定端口：
+
+```bash
+WEB_PORT=9000 bash <(curl -fsSL https://raw.githubusercontent.com/yeah1z1/docker-migrate-oneclick/main/docker-migrate.sh) --web
 ```
 
 ## 会迁移什么
@@ -92,6 +124,12 @@ bash docker-migrate.sh --backup-local --all
 
 ```bash
 PORT=9000 bash <(curl -fsSL https://raw.githubusercontent.com/yeah1z1/docker-migrate-oneclick/main/docker-migrate.sh)
+```
+
+网页控制台默认使用 `8090` 端口：
+
+```bash
+WEB_PORT=9000 bash <(curl -fsSL https://raw.githubusercontent.com/yeah1z1/docker-migrate-oneclick/main/docker-migrate.sh) --web
 ```
 
 ## 安装为本地命令
