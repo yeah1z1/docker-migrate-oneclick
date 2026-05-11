@@ -14,3 +14,5 @@ jobs:
           bash -n docker-migrate.sh
           bash -n install.sh
           python3 scripts/check-embedded-web.py
+      - name: Docker build check
+        run: docker build -t docker-migrate-oneclick:test .

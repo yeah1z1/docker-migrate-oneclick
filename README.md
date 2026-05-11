@@ -23,7 +23,27 @@ bash <(curl -fsSL https://raw.githubusercontent.com/yeah1z1/docker-migrate-onecl
 
 ## 可视化网页
 
-老机器启动网页控制台：
+推荐直接用 Docker 镜像启动网页控制台，端口固定为 `5555`：
+
+```bash
+docker run -d \
+  --name docker-migrate-cn \
+  --restart unless-stopped \
+  -p 5555:5555 \
+  -v /var/run/docker.sock:/var/run/docker.sock \
+  -v /tmp/docker-migrate-cn:/tmp/docker-migrate-cn \
+  -v /:/host \
+  -e HOST_ROOT=/host \
+  ghcr.io/yeah1z1/docker-migrate-oneclick:latest
+```
+
+查看访问地址和 token：
+
+```bash
+docker logs docker-migrate-cn
+```
+
+也可以不使用镜像，老机器直接运行脚本启动网页控制台：
 
 ```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/yeah1z1/docker-migrate-oneclick/main/docker-migrate.sh) --web
@@ -32,8 +52,8 @@ bash <(curl -fsSL https://raw.githubusercontent.com/yeah1z1/docker-migrate-onecl
 脚本会输出类似下面的访问地址：
 
 ```text
-本机访问：http://127.0.0.1:8090/?token=xxxx
-局域网访问：http://OLD_SERVER_IP:8090/?token=xxxx
+本机访问：http://127.0.0.1:5555/?token=xxxx
+局域网访问：http://OLD_SERVER_IP:5555/?token=xxxx
 ```
 
 在网页里可以：
@@ -45,6 +65,8 @@ bash <(curl -fsSL https://raw.githubusercontent.com/yeah1z1/docker-migrate-onecl
 - 在新机器网页里粘贴迁移包链接并恢复
 
 网页地址会带一次性 `token`，不要把网页控制台暴露到公网。
+
+如果想让日志里直接显示正确的访问地址，可以额外加 `-e PUBLIC_HOST=你的服务器IP`。如果不填，也可以直接访问 `http://服务器IP:5555`。如果你不想让工具容器拥有宿主机根目录写权限，只在老机器备份时可以把 `-v /:/host` 改成 `-v /:/host:ro`。新机器恢复 bind mount 数据时需要写权限。
 
 ## 典型流程
 
@@ -93,7 +115,7 @@ bash docker-migrate.sh --backup-local --all
 启动网页控制台并指定端口：
 
 ```bash
-WEB_PORT=9000 bash <(curl -fsSL https://raw.githubusercontent.com/yeah1z1/docker-migrate-oneclick/main/docker-migrate.sh) --web
+WEB_PORT=5555 bash <(curl -fsSL https://raw.githubusercontent.com/yeah1z1/docker-migrate-oneclick/main/docker-migrate.sh) --web
 ```
 
 ## 会迁移什么
@@ -126,10 +148,20 @@ WEB_PORT=9000 bash <(curl -fsSL https://raw.githubusercontent.com/yeah1z1/docker
 PORT=9000 bash <(curl -fsSL https://raw.githubusercontent.com/yeah1z1/docker-migrate-oneclick/main/docker-migrate.sh)
 ```
 
-网页控制台默认使用 `8090` 端口：
+网页控制台默认使用 `5555` 端口：
 
 ```bash
-WEB_PORT=9000 bash <(curl -fsSL https://raw.githubusercontent.com/yeah1z1/docker-migrate-oneclick/main/docker-migrate.sh) --web
+WEB_PORT=5555 bash <(curl -fsSL https://raw.githubusercontent.com/yeah1z1/docker-migrate-oneclick/main/docker-migrate.sh) --web
+```
+
+## Docker Compose
+
+也可以用 Compose 启动：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/yeah1z1/docker-migrate-oneclick/main/compose.yml -o compose.yml
+docker compose up -d
+docker logs docker-migrate-cn
 ```
 
 ## 安装为本地命令

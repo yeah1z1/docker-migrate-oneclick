@@ -1,0 +1,14 @@
+services:
+  docker-migrate:
+    image: ghcr.io/yeah1z1/docker-migrate-oneclick:latest
+    container_name: docker-migrate-cn
+    restart: unless-stopped
+    ports:
+      - "5555:5555"
+    environment:
+      WEB_PORT: "5555"
+      HOST_ROOT: /host
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /tmp/docker-migrate-cn:/tmp/docker-migrate-cn
+      - /:/host

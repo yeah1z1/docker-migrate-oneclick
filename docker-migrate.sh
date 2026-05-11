@@ -2,13 +2,15 @@
 set -Eeuo pipefail
 
 APP_NAME="Docker迁移一键通"
-VERSION="1.1.0"
+VERSION="1.2.0"
 HELPER_IMAGE="${HELPER_IMAGE:-alpine:3.20}"
 WORK_ROOT="${WORK_ROOT:-/tmp/docker-migrate-cn}"
 DEFAULT_PORT="${PORT:-8088}"
-WEB_PORT="${WEB_PORT:-8090}"
+WEB_PORT="${WEB_PORT:-5555}"
 AUTO_STOP_MODE="${AUTO_STOP_MODE:-ask}"
 RAW_SCRIPT_URL="https://raw.githubusercontent.com/yeah1z1/docker-migrate-oneclick/main/docker-migrate.sh"
+HOST_ROOT="${HOST_ROOT:-}"
+PUBLIC_HOST="${PUBLIC_HOST:-}"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -97,6 +99,23 @@ safe_name() {
   printf '%s' "$1" | sed 's#[^A-Za-z0-9_.-]#_#g; s#^_*##; s#_*$##' | cut -c1-120
 }
 
+host_path() {
+  local path="$1"
+  if [[ -n "$HOST_ROOT" && "$path" == /* ]]; then
+    printf '%s\n' "${HOST_ROOT%/}$path"
+  else
+    printf '%s\n' "$path"
+  fi
+}
+
+host_tar_root() {
+  if [[ -n "$HOST_ROOT" ]]; then
+    printf '%s\n' "${HOST_ROOT%/}"
+  else
+    printf '/\n'
+  fi
+}
+
 random_id() {
   date +%Y%m%d%H%M%S
 }
@@ -105,6 +124,16 @@ local_ip() {
   ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++){if($i=="src"){print $(i+1); exit}}}' ||
     hostname -I 2>/dev/null | awk '{print $1}' ||
     echo "127.0.0.1"
+}
+
+public_host() {
+  if [[ -n "$PUBLIC_HOST" ]]; then
+    printf '%s\n' "$PUBLIC_HOST"
+  elif [[ -f /.dockerenv ]]; then
+    printf '服务器IP\n'
+  else
+    local_ip
+  fi
 }
 
 ask_yes_no() {
@@ -247,6 +276,7 @@ set -Eeuo pipefail
 
 APP_NAME="Docker迁移一键通"
 HELPER_IMAGE="${HELPER_IMAGE:-alpine:3.20}"
+HOST_ROOT="${HOST_ROOT:-}"
 
 log() { printf '[%s] %s\n' "$APP_NAME" "$*"; }
 warn() { printf '[提示] %s\n' "$*" >&2; }
@@ -267,6 +297,23 @@ ensure_runtime() {
 
 safe_name() {
   printf '%s' "$1" | sed 's#[^A-Za-z0-9_.-]#_#g; s#^_*##; s#_*$##' | cut -c1-120
+}
+
+host_path() {
+  local path="$1"
+  if [[ -n "$HOST_ROOT" && "$path" == /* ]]; then
+    printf '%s\n' "${HOST_ROOT%/}$path"
+  else
+    printf '%s\n' "$path"
+  fi
+}
+
+host_tar_root() {
+  if [[ -n "$HOST_ROOT" ]]; then
+    printf '%s\n' "${HOST_ROOT%/}"
+  else
+    printf '/\n'
+  fi
 }
 
 create_network_from_json() {
@@ -327,13 +374,14 @@ restore_volumes() {
 
 restore_binds() {
   [[ -f "$SCRIPT_DIR/binds.tsv" ]] || return 0
-  local source archive parent
+  local source archive parent target_source
   while IFS=$'\t' read -r source archive; do
     [[ -z "$source" || -z "$archive" ]] && continue
-    parent="$(dirname "$source")"
+    target_source="$(host_path "$source")"
+    parent="$(dirname "$target_source")"
     mkdir -p "$parent"
     log "恢复宿主机挂载目录：$source"
-    tar xzf "$SCRIPT_DIR/binds/$archive" -C /
+    tar xzf "$SCRIPT_DIR/binds/$archive" -C "$(host_tar_root)"
   done < "$SCRIPT_DIR/binds.tsv"
 }
 
@@ -574,11 +622,12 @@ backup_bundle() {
     printf '%s\t%s\n' "$volume" "$vol_archive" >> "$bundle/volumes.tsv"
   done < "$volumes_file"
 
-  local bind index bind_archive stripped
+  local bind index bind_archive stripped bind_source
   index=0
   while read -r bind; do
     [[ -z "$bind" ]] && continue
-    if [[ ! -e "$bind" ]]; then
+    bind_source="$(host_path "$bind")"
+    if [[ ! -e "$bind_source" ]]; then
       warn "宿主机挂载路径不存在，跳过数据打包：$bind"
       continue
     fi
@@ -586,7 +635,7 @@ backup_bundle() {
     bind_archive="$(printf '%03d_%s.tgz' "$index" "$(safe_name "$bind")")"
     stripped="${bind#/}"
     log "打包宿主机挂载路径：$bind"
-    tar czf "$bundle/binds/$bind_archive" -C / "$stripped"
+    tar czf "$bundle/binds/$bind_archive" -C "$(host_tar_root)" "$stripped"
     printf '%s\t%s\n' "$bind" "$bind_archive" >> "$bundle/binds.tsv"
   done < "$binds_file"
 
@@ -1220,7 +1269,7 @@ class Handler(BaseHTTPRequestHandler):
 
 def main():
     WORK_ROOT.mkdir(parents=True, exist_ok=True)
-    port = int(os.environ.get("WEB_PORT", "8090"))
+    port = int(os.environ.get("WEB_PORT", "5555"))
     server = ThreadingHTTPServer(("0.0.0.0", port), Handler)
     print(f"{APP_NAME} 网页控制台已启动")
     print(f"访问地址：http://127.0.0.1:{port}/?token={TOKEN}")
@@ -1240,7 +1289,7 @@ PYWEB_EOF
 
   title "网页控制台"
   printf "本机访问：http://127.0.0.1:%s/?token=%s\n" "$WEB_PORT" "$web_token"
-  printf "局域网访问：http://%s:%s/?token=%s\n" "$(local_ip)" "$WEB_PORT" "$web_token"
+  printf "局域网访问：http://%s:%s/?token=%s\n" "$(public_host)" "$WEB_PORT" "$web_token"
   warn "网页可以执行 Docker 迁移操作，请不要暴露到公网；按 Ctrl+C 结束"
   python3 "$web_app"
 }
@@ -1312,7 +1361,8 @@ $APP_NAME v$VERSION
 
 环境变量：
   PORT=8088                 命令行分享迁移包的端口
-  WEB_PORT=8090             网页控制台端口
+  WEB_PORT=5555             网页控制台端口
+  HOST_ROOT=/host           Docker镜像模式下宿主机根目录挂载点
   HELPER_IMAGE=alpine:3.20  数据卷打包辅助镜像
 EOF
 }

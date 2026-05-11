@@ -1,0 +1,9 @@
+.git
+.github
+docker_migrate_*
+*.tar
+*.tar.gz
+*.tgz
+*.bundle
+__pycache__
+*.pyc
