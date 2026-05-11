@@ -1,153 +1,115 @@
-# Docker Migrate OneClick
+# Docker迁移一键通
 
-Linux 服务器之间迁移 Docker 的一键工具。它可以整机迁移，也可以按容器、镜像、卷、网络单选迁移，适合从老机器搬到新机器。
+一条命令完成 Linux 服务器 Docker 容器迁移。老机器生成迁移包下载链接，新机器输入链接自动恢复，支持全量迁移，也支持按编号单选/多选容器迁移。
 
-> 当前版本专注 Docker Engine/CLI。Compose 项目会按容器、镜像、卷、网络恢复，但不会自动还原原始 `docker-compose.yml` 文件。
+## 一条命令运行
 
-## 功能
+老机器和新机器都执行同一条命令：
 
-- 一条命令从老机器迁移到新机器
-- 支持全量迁移：容器、镜像、数据卷、自定义网络
-- 支持单选迁移：指定容器、镜像、卷、网络
-- 支持交互选择：本机运行时可用编号选择
-- 自动打包镜像和 Docker volume 数据
-- 恢复容器的常见参数：环境变量、标签、端口、挂载、重启策略、资源限制、网络连接等
-- 纯 Python 标准库实现，无第三方 Python 依赖
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/yeah1z1/docker-migrate-oneclick/main/docker-migrate.sh)
+```
+
+运行后出现中文菜单：
+
+```text
+1) 老机器：备份并生成下载链接
+2) 新机器：输入链接下载并恢复
+3) 只备份到本地文件
+4) 从本地迁移包恢复
+5) 退出
+```
+
+## 典型流程
+
+老机器执行：
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/yeah1z1/docker-migrate-oneclick/main/docker-migrate.sh)
+```
+
+选择 `1) 老机器：备份并生成下载链接`，然后选择全部容器或按编号选择容器。脚本会输出一个迁移包链接。
+
+新机器执行同一条命令：
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/yeah1z1/docker-migrate-oneclick/main/docker-migrate.sh)
+```
+
+选择 `2) 新机器：输入链接下载并恢复`，粘贴老机器生成的链接即可。
+
+## 非交互用法
+
+全量备份并生成下载链接：
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/yeah1z1/docker-migrate-oneclick/main/docker-migrate.sh) --backup-link --all
+```
+
+指定容器迁移：
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/yeah1z1/docker-migrate-oneclick/main/docker-migrate.sh) --backup-link --containers nginx,redis
+```
+
+新机器直接下载恢复：
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/yeah1z1/docker-migrate-oneclick/main/docker-migrate.sh) --restore http://OLD_SERVER_IP:8088/docker_migrate_xxx.tar.gz
+```
+
+只备份到本地文件：
+
+```bash
+bash docker-migrate.sh --backup-local --all
+```
+
+## 会迁移什么
+
+- Docker 镜像
+- 容器配置
+- 命名数据卷 volume
+- bind mount 宿主机目录数据
+- 自定义 Docker 网络
+- 常见容器参数：环境变量、标签、端口映射、挂载、重启策略、用户、工作目录、特权模式等
 
 ## 系统要求
 
-老机器和新机器都需要：
-
 - Linux
-- Python 3.8+
-- Docker Engine，并且当前用户能执行 `docker`
-- 迁移模式需要 `ssh` 和 `scp`
+- Docker Engine
+- `bash`
+- `curl`
+- `jq`
+- `tar`
+- `gzip`
+- `python3`
 
-如果要迁移 volume 数据，脚本会使用一个辅助镜像打包/解包数据，默认是 `alpine:3.20`。
+脚本会尝试自动安装缺少的常用依赖；Docker Engine 需要你提前安装并启动。
 
-## 快速开始
+## 自定义端口
 
-在老机器上运行，把所有 Docker 对象迁移到新机器：
+老机器分享迁移包默认使用 `8088` 端口：
 
 ```bash
-chmod +x ./bin/docker-migrate
-./bin/docker-migrate migrate --target root@NEW_SERVER_IP --all --replace --start
+PORT=9000 bash <(curl -fsSL https://raw.githubusercontent.com/yeah1z1/docker-migrate-oneclick/main/docker-migrate.sh)
 ```
 
-从第三台控制机发起迁移：
+## 安装为本地命令
 
 ```bash
-./bin/docker-migrate migrate \
-  --source root@OLD_SERVER_IP \
-  --target root@NEW_SERVER_IP \
-  --all \
-  --replace \
-  --start
-```
-
-只迁移指定容器，脚本会自动包含这些容器使用的镜像、命名卷和自定义网络：
-
-```bash
-./bin/docker-migrate migrate \
-  --target root@NEW_SERVER_IP \
-  --containers nginx,redis \
-  --replace \
-  --start
-```
-
-交互选择迁移对象：
-
-```bash
-./bin/docker-migrate backup --select --output ./backup
-./bin/docker-migrate restore --file ./backup/docker-migrate-YYYYMMDD-HHMMSS.tar.gz --replace --start
-```
-
-## 常用命令
-
-查看当前机器 Docker 对象：
-
-```bash
-./bin/docker-migrate list
-./bin/docker-migrate list --format json
-```
-
-仅备份，不恢复：
-
-```bash
-./bin/docker-migrate backup --all --output ./backup
-```
-
-在新机器恢复：
-
-```bash
-./bin/docker-migrate restore --file ./docker-migrate-20260511-120000.tar.gz --replace --start
-```
-
-迁移指定对象：
-
-```bash
-./bin/docker-migrate migrate \
-  --target root@NEW_SERVER_IP \
-  --containers app,worker \
-  --volumes shared_data \
-  --images busybox:latest \
-  --networks app_net \
-  --replace \
-  --start
-```
-
-迁移前短暂停住选中的运行容器，提升 volume 快照一致性：
-
-```bash
-./bin/docker-migrate migrate --target root@NEW_SERVER_IP --all --pause --replace --start
-```
-
-## 安装到系统
-
-```bash
+git clone https://github.com/yeah1z1/docker-migrate-oneclick.git
+cd docker-migrate-oneclick
 sudo ./install.sh
-docker-migrate --version
+docker-migrate-cn
 ```
 
-也可以不安装，直接运行 `./bin/docker-migrate`。
+## 注意事项
 
-## 发布到 GitHub
+- 数据库容器建议先做业务级备份，迁移时选择临时停止容器可以降低数据不一致风险。
+- bind mount 会按原宿主机绝对路径恢复，新机器路径规划要提前确认。
+- 目标机器已有同名容器时会删除后重建；已有 volume 会覆盖写入数据。
+- 特殊网络插件、特殊存储驱动、宿主机防火墙、系统服务、crontab、Docker daemon 配置不在迁移范围内。
 
-```bash
-git init
-git add .
-git commit -m "Initial docker migration tool"
-git branch -M main
-git remote add origin git@github.com:YOUR_NAME/docker-migrate-oneclick.git
-git push -u origin main
-```
-
-发布后可以把快速安装命令写成：
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/YOUR_NAME/docker-migrate-oneclick/main/bin/docker-migrate -o docker-migrate
-chmod +x docker-migrate
-./docker-migrate --version
-```
-
-## 重要说明
-
-- 数据库类容器建议先做业务级备份，或者使用 `--pause` 降低 volume 数据不一致风险。
-- bind mount 的宿主机路径只会恢复挂载配置，不会自动打包宿主机目录数据。manifest 会记录相关警告。
-- 如果目标机器已有同名容器或 volume，默认会跳过；使用 `--replace` 才会删除并重建。
-- 自定义网络会尽量恢复 driver、IPAM、label、option 等常见配置；特殊网络插件需要目标机器已安装相同插件。
-- 脚本不迁移 Docker daemon 配置、镜像仓库登录态、防火墙规则、系统服务文件、crontab 等宿主机级配置。
-
-## 参数速查
-
-```bash
-docker-migrate list
-docker-migrate backup  --all|--select|--containers app,db [--output ./backup]
-docker-migrate restore --file archive.tar.gz [--replace] [--start]
-docker-migrate migrate --target user@new --all [--replace] [--start]
-docker-migrate migrate --source user@old --target user@new --containers app,db
-```
-
-## License
+## 开源协议
 
 MIT
