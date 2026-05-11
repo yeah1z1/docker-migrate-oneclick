@@ -1,0 +1,1183 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import json
+import os
+import re
+import shlex
+import shutil
+import socket
+import subprocess
+import sys
+import tarfile
+import tempfile
+from pathlib import Path
+from typing import Any, Iterable
+
+
+VERSION = "0.1.0"
+DEFAULT_HELPER_IMAGE = os.environ.get("DOCKER_MIGRATE_HELPER_IMAGE", "alpine:3.20")
+DEFAULT_REMOTE_DIR = "/tmp/docker-migrate"
+BUILTIN_NETWORKS = {"bridge", "host", "none"}
+
+
+class MigrationError(RuntimeError):
+    pass
+
+
+def note(message: str) -> None:
+    print(f"[docker-migrate] {message}", flush=True)
+
+
+def warn(message: str) -> None:
+    print(f"[docker-migrate][warn] {message}", file=sys.stderr, flush=True)
+
+
+def fail(message: str, code: int = 1) -> None:
+    print(f"[docker-migrate][error] {message}", file=sys.stderr, flush=True)
+    raise SystemExit(code)
+
+
+def command_exists(name: str) -> bool:
+    return shutil.which(name) is not None
+
+
+def require_command(name: str) -> None:
+    if not command_exists(name):
+        fail(f"required command not found: {name}")
+
+
+def printable(cmd: Iterable[str]) -> str:
+    return shlex.join([str(part) for part in cmd])
+
+
+def run(
+    cmd: list[str],
+    *,
+    capture: bool = False,
+    check: bool = True,
+    dry_run: bool = False,
+    input_text: str | None = None,
+) -> str:
+    if dry_run:
+        print(f"+ {printable(cmd)}")
+        return ""
+
+    try:
+        proc = subprocess.run(
+            cmd,
+            input=input_text,
+            text=True,
+            stdout=subprocess.PIPE if capture else None,
+            stderr=subprocess.PIPE if capture else None,
+            check=False,
+        )
+    except FileNotFoundError:
+        if check:
+            fail(f"command not found: {cmd[0]}")
+        return ""
+
+    if check and proc.returncode != 0:
+        detail = ""
+        if capture and proc.stderr:
+            detail = "\n" + proc.stderr.strip()
+        raise MigrationError(f"command failed: {printable(cmd)}{detail}")
+
+    return proc.stdout if capture and proc.stdout else ""
+
+
+def docker(args: list[str], *, capture: bool = False, check: bool = True, dry_run: bool = False) -> str:
+    return run(["docker", *args], capture=capture, check=check, dry_run=dry_run)
+
+
+def docker_json(args: list[str]) -> Any:
+    output = docker(args, capture=True)
+    if not output.strip():
+        return None
+    return json.loads(output)
+
+
+def docker_lines_json(args: list[str]) -> list[dict[str, Any]]:
+    output = docker(args, capture=True)
+    rows: list[dict[str, Any]] = []
+    for line in output.splitlines():
+        line = line.strip()
+        if line:
+            rows.append(json.loads(line))
+    return rows
+
+
+def ordered_unique(values: Iterable[str]) -> list[str]:
+    seen: set[str] = set()
+    result: list[str] = []
+    for value in values:
+        value = str(value).strip()
+        if value and value not in seen:
+            seen.add(value)
+            result.append(value)
+    return result
+
+
+def split_csv(values: list[str] | None) -> list[str]:
+    result: list[str] = []
+    for value in values or []:
+        result.extend(part.strip() for part in value.split(",") if part.strip())
+    return ordered_unique(result)
+
+
+def sanitize_filename(value: str) -> str:
+    value = re.sub(r"[^A-Za-z0-9_.-]+", "_", value.strip())
+    value = value.strip("._")
+    return value[:160] or "item"
+
+
+def now_stamp() -> str:
+    return dt.datetime.now(dt.timezone.utc).strftime("%Y%m%d-%H%M%S")
+
+
+def ensure_archive_name(name: str | None) -> str:
+    if not name:
+        return f"docker-migrate-{now_stamp()}.tar.gz"
+    if name.endswith((".tar.gz", ".tgz", ".tar")):
+        return name
+    return f"{name}.tar.gz"
+
+
+def ensure_docker_ready() -> None:
+    require_command("docker")
+    docker(["version", "--format", "{{.Server.Version}}"], capture=True)
+
+
+def ensure_helper_image(helper_image: str, no_pull: bool) -> None:
+    if docker(["image", "inspect", helper_image], capture=True, check=False).strip():
+        return
+    if no_pull:
+        warn(f"helper image is missing and --no-pull-helper was used: {helper_image}")
+        return
+    note(f"pulling helper image {helper_image}")
+    docker(["pull", helper_image])
+
+
+def inspect_many(kind: str, names: list[str]) -> list[dict[str, Any]]:
+    if not names:
+        return []
+    return docker_json([kind, "inspect", *names])
+
+
+def list_containers() -> list[dict[str, Any]]:
+    return docker_lines_json(["ps", "-a", "--format", "{{json .}}"])
+
+
+def list_images() -> list[dict[str, Any]]:
+    return docker_lines_json(["image", "ls", "--all", "--no-trunc", "--format", "{{json .}}"])
+
+
+def list_volumes() -> list[dict[str, Any]]:
+    return docker_lines_json(["volume", "ls", "--format", "{{json .}}"])
+
+
+def list_networks() -> list[dict[str, Any]]:
+    return docker_lines_json(["network", "ls", "--format", "{{json .}}"])
+
+
+def image_ref_from_row(row: dict[str, Any]) -> str:
+    repo = row.get("Repository") or ""
+    tag = row.get("Tag") or ""
+    image_id = row.get("ID") or ""
+    if repo and tag and repo != "<none>" and tag != "<none>":
+        return f"{repo}:{tag}"
+    return image_id
+
+
+def all_image_refs() -> list[str]:
+    return ordered_unique(image_ref_from_row(row) for row in list_images())
+
+
+def all_volume_names() -> list[str]:
+    return ordered_unique(row.get("Name", "") for row in list_volumes())
+
+
+def all_container_names() -> list[str]:
+    return ordered_unique(row.get("Names", "") for row in list_containers())
+
+
+def all_custom_network_names() -> list[str]:
+    return ordered_unique(
+        row.get("Name", "")
+        for row in list_networks()
+        if row.get("Name") and row.get("Name") not in BUILTIN_NETWORKS
+    )
+
+
+def parse_selection(input_value: str, count: int) -> list[int]:
+    value = input_value.strip().lower()
+    if not value:
+        return []
+    if value in {"all", "*"}:
+        return list(range(count))
+
+    indexes: list[int] = []
+    for part in value.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            left, right = part.split("-", 1)
+            start = int(left)
+            end = int(right)
+            indexes.extend(range(start - 1, end))
+        else:
+            indexes.append(int(part) - 1)
+    selected: list[int] = []
+    seen: set[int] = set()
+    for idx in indexes:
+        if 0 <= idx < count and idx not in seen:
+            selected.append(idx)
+            seen.add(idx)
+    return selected
+
+
+def choose_items(title: str, labels: list[str], values: list[str]) -> list[str]:
+    if not values:
+        return []
+    print()
+    print(title)
+    for idx, label in enumerate(labels, start=1):
+        print(f"  {idx}. {label}")
+    print("Enter numbers like 1,3-5, enter 'all' for all, or press Enter to skip.")
+    raw = input("> ")
+    indexes = [int(idx) for idx in parse_selection(raw, len(values))]
+    return [values[idx] for idx in indexes]
+
+
+def interactive_plan() -> tuple[list[str], list[str], list[str], list[str]]:
+    containers = list_containers()
+    images = list_images()
+    volumes = list_volumes()
+    networks = [row for row in list_networks() if row.get("Name") not in BUILTIN_NETWORKS]
+
+    selected_containers = choose_items(
+        "Select containers",
+        [f"{row.get('Names')} ({row.get('Status')})" for row in containers],
+        [row.get("Names", "") for row in containers],
+    )
+    selected_images = choose_items(
+        "Select extra images",
+        [image_ref_from_row(row) for row in images],
+        [image_ref_from_row(row) for row in images],
+    )
+    selected_volumes = choose_items(
+        "Select extra volumes",
+        [row.get("Name", "") for row in volumes],
+        [row.get("Name", "") for row in volumes],
+    )
+    selected_networks = choose_items(
+        "Select extra custom networks",
+        [row.get("Name", "") for row in networks],
+        [row.get("Name", "") for row in networks],
+    )
+    return selected_containers, selected_images, selected_volumes, selected_networks
+
+
+def container_name(container: dict[str, Any]) -> str:
+    return str(container.get("Name", "")).lstrip("/")
+
+
+def container_image_ref(container: dict[str, Any]) -> str:
+    config = container.get("Config") or {}
+    return config.get("Image") or container.get("Image") or ""
+
+
+def container_named_volumes(container: dict[str, Any]) -> list[str]:
+    volumes: list[str] = []
+    for mount in container.get("Mounts") or []:
+        if mount.get("Type") == "volume" and mount.get("Name"):
+            volumes.append(mount["Name"])
+    return ordered_unique(volumes)
+
+
+def container_custom_networks(container: dict[str, Any]) -> list[str]:
+    networks = ((container.get("NetworkSettings") or {}).get("Networks") or {}).keys()
+    return ordered_unique(name for name in networks if name not in BUILTIN_NETWORKS)
+
+
+def collect_bind_mount_warnings(containers: list[dict[str, Any]]) -> list[dict[str, str]]:
+    warnings: list[dict[str, str]] = []
+    for container in containers:
+        name = container_name(container)
+        for mount in container.get("Mounts") or []:
+            if mount.get("Type") == "bind":
+                warnings.append(
+                    {
+                        "type": "bind-mount",
+                        "container": name,
+                        "source": mount.get("Source", ""),
+                        "destination": mount.get("Destination", ""),
+                        "message": "bind mount metadata is restored, but host path data is not archived",
+                    }
+                )
+    return warnings
+
+
+def build_plan(args: argparse.Namespace) -> dict[str, Any]:
+    containers = split_csv(getattr(args, "containers", None))
+    images = split_csv(getattr(args, "images", None))
+    volumes = split_csv(getattr(args, "volumes", None))
+    networks = split_csv(getattr(args, "networks", None))
+
+    if args.all:
+        containers = all_container_names()
+        images = all_image_refs()
+        volumes = all_volume_names()
+        networks = all_custom_network_names()
+    elif not any([containers, images, volumes, networks]):
+        if args.select or sys.stdin.isatty():
+            containers, images, volumes, networks = interactive_plan()
+        else:
+            fail("no migration target selected; use --all, --select, or --containers/--images/--volumes/--networks")
+
+    inspected_containers = inspect_many("container", containers)
+
+    dependency_images = [container_image_ref(item) for item in inspected_containers]
+    dependency_volumes = [volume for item in inspected_containers for volume in container_named_volumes(item)]
+    dependency_networks = [network for item in inspected_containers for network in container_custom_networks(item)]
+
+    images = ordered_unique([*images, *dependency_images])
+    volumes = ordered_unique([*volumes, *dependency_volumes])
+    networks = ordered_unique([network for network in [*networks, *dependency_networks] if network not in BUILTIN_NETWORKS])
+
+    inspected_volumes = inspect_many("volume", volumes)
+    inspected_networks = inspect_many("network", networks)
+
+    return {
+        "containers": inspected_containers,
+        "images": images,
+        "volumes": inspected_volumes,
+        "networks": inspected_networks,
+        "warnings": collect_bind_mount_warnings(inspected_containers),
+    }
+
+
+def pause_running_containers(containers: list[dict[str, Any]]) -> list[str]:
+    running = [
+        container_name(container)
+        for container in containers
+        if (container.get("State") or {}).get("Running") and not (container.get("State") or {}).get("Paused")
+    ]
+    if running:
+        note(f"pausing containers: {', '.join(running)}")
+        docker(["pause", *running])
+    return running
+
+
+def unpause_containers(names: list[str]) -> None:
+    if names:
+        note(f"unpausing containers: {', '.join(names)}")
+        docker(["unpause", *names], check=False)
+
+
+def save_image(ref: str, index: int, images_dir: Path) -> dict[str, Any]:
+    filename = f"{index:04d}-{sanitize_filename(ref)}.tar"
+    target = images_dir / filename
+    note(f"saving image {ref}")
+    docker(["save", "-o", str(target), ref])
+    if not target.exists():
+        raise MigrationError(f"failed to save image: {ref}")
+    image_id = docker(["image", "inspect", ref, "--format", "{{.Id}}"], capture=True, check=False).strip()
+    return {"ref": ref, "id": image_id, "file": f"images/{filename}"}
+
+
+def archive_volume(volume: dict[str, Any], index: int, volumes_dir: Path, helper_image: str, no_pull: bool) -> dict[str, Any]:
+    name = volume.get("Name")
+    if not name:
+        raise MigrationError("volume inspect result did not include Name")
+    filename = f"{index:04d}-{sanitize_filename(name)}.tar"
+    note(f"archiving volume {name}")
+    ensure_helper_image(helper_image, no_pull)
+    docker(
+        [
+            "run",
+            "--rm",
+            "-v",
+            f"{name}:/from:ro",
+            "-v",
+            f"{volumes_dir}:/backup",
+            helper_image,
+            "sh",
+            "-c",
+            f"cd /from && tar cpf /backup/{shlex.quote(filename)} .",
+        ]
+    )
+    return {"name": name, "file": f"volumes/{filename}", "inspect": volume}
+
+
+def write_json(path: Path, value: Any) -> None:
+    path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def create_archive(bundle_dir: Path, archive_path: Path) -> None:
+    mode = "w:gz" if archive_path.name.endswith((".gz", ".tgz")) else "w"
+    with tarfile.open(archive_path, mode) as archive:
+        archive.add(bundle_dir, arcname="docker-migrate")
+
+
+def backup(args: argparse.Namespace) -> Path:
+    ensure_docker_ready()
+    output_dir = Path(args.output).expanduser().resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    archive_name = ensure_archive_name(args.archive_name)
+    archive_path = output_dir / archive_name
+
+    if archive_path.exists() and not args.overwrite:
+        fail(f"archive already exists: {archive_path}; use --overwrite to replace it")
+
+    bundle_name = re.sub(r"\.tar(\.gz)?$|\.tgz$", "", archive_name)
+    bundle_dir = output_dir / f"{bundle_name}.bundle"
+    if bundle_dir.exists():
+        if args.overwrite:
+            shutil.rmtree(bundle_dir)
+        else:
+            fail(f"bundle directory already exists: {bundle_dir}; use --overwrite to replace it")
+
+    (bundle_dir / "images").mkdir(parents=True)
+    (bundle_dir / "volumes").mkdir(parents=True)
+    (bundle_dir / "metadata").mkdir(parents=True)
+
+    note("building migration plan")
+    plan = build_plan(args)
+
+    paused: list[str] = []
+    try:
+        if args.pause:
+            paused = pause_running_containers(plan["containers"])
+
+        images: list[dict[str, Any]] = []
+        for idx, ref in enumerate(plan["images"], start=1):
+            images.append(save_image(ref, idx, bundle_dir / "images"))
+
+        volumes: list[dict[str, Any]] = []
+        for idx, volume in enumerate(plan["volumes"], start=1):
+            volumes.append(archive_volume(volume, idx, bundle_dir / "volumes", args.helper_image, args.no_pull_helper))
+    finally:
+        unpause_containers(paused)
+
+    manifest = {
+        "schema": "docker-migrate.v1",
+        "version": VERSION,
+        "created_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+        "source": {
+            "hostname": socket.gethostname(),
+        },
+        "objects": {
+            "containers": plan["containers"],
+            "images": images,
+            "volumes": volumes,
+            "networks": plan["networks"],
+        },
+        "warnings": plan["warnings"],
+    }
+    write_json(bundle_dir / "manifest.json", manifest)
+    write_json(bundle_dir / "metadata" / "containers.json", plan["containers"])
+    write_json(bundle_dir / "metadata" / "networks.json", plan["networks"])
+    write_json(bundle_dir / "metadata" / "volumes.json", plan["volumes"])
+
+    note(f"creating archive {archive_path}")
+    create_archive(bundle_dir, archive_path)
+    if not args.keep_bundle:
+        shutil.rmtree(bundle_dir)
+
+    note(f"backup complete: {archive_path}")
+    return archive_path
+
+
+def safe_extract(archive: tarfile.TarFile, target: Path) -> None:
+    target = target.resolve()
+    for member in archive.getmembers():
+        destination = (target / member.name).resolve()
+        try:
+            destination.relative_to(target)
+        except ValueError:
+            raise MigrationError(f"unsafe path in archive: {member.name}")
+    archive.extractall(target)
+
+
+def extract_bundle(archive_path: Path) -> tuple[Path, tempfile.TemporaryDirectory[str] | None]:
+    temp = tempfile.TemporaryDirectory(prefix="docker-migrate-restore-")
+    temp_path = Path(temp.name)
+    with tarfile.open(archive_path, "r:*") as archive:
+        safe_extract(archive, temp_path)
+    bundle = temp_path / "docker-migrate"
+    if not (bundle / "manifest.json").exists():
+        temp.cleanup()
+        raise MigrationError("archive does not contain docker-migrate/manifest.json")
+    return bundle, temp
+
+
+def load_manifest(bundle_dir: Path) -> dict[str, Any]:
+    manifest_path = bundle_dir / "manifest.json"
+    if not manifest_path.exists():
+        raise MigrationError(f"manifest not found: {manifest_path}")
+    return json.loads(manifest_path.read_text(encoding="utf-8"))
+
+
+def object_exists(kind: str, name: str) -> bool:
+    return docker([kind, "inspect", name], capture=True, check=False).strip() != ""
+
+
+def confirm(prompt: str, yes: bool) -> bool:
+    if yes:
+        return True
+    if not sys.stdin.isatty():
+        return False
+    answer = input(f"{prompt} [y/N] ").strip().lower()
+    return answer in {"y", "yes"}
+
+
+def restore_images(bundle_dir: Path, manifest: dict[str, Any], dry_run: bool) -> None:
+    for image in manifest["objects"].get("images") or []:
+        image_file = bundle_dir / image["file"]
+        note(f"loading image {image.get('ref')}")
+        docker(["load", "-i", str(image_file)], dry_run=dry_run)
+
+
+def restore_network(network: dict[str, Any], dry_run: bool) -> None:
+    name = network.get("Name")
+    if not name or name in BUILTIN_NETWORKS:
+        return
+    if object_exists("network", name):
+        note(f"network exists, skipping: {name}")
+        return
+
+    args = ["network", "create"]
+    driver = network.get("Driver")
+    if driver:
+        args += ["--driver", driver]
+    if network.get("Internal"):
+        args.append("--internal")
+    if network.get("Attachable"):
+        args.append("--attachable")
+    if network.get("EnableIPv6"):
+        args.append("--ipv6")
+    for key, value in (network.get("Labels") or {}).items():
+        args += ["--label", f"{key}={value}"]
+    for key, value in (network.get("Options") or {}).items():
+        args += ["--opt", f"{key}={value}"]
+
+    ipam = network.get("IPAM") or {}
+    if ipam.get("Driver") and ipam.get("Driver") != "default":
+        args += ["--ipam-driver", ipam["Driver"]]
+    for option_key, option_value in (ipam.get("Options") or {}).items():
+        args += ["--ipam-opt", f"{option_key}={option_value}"]
+    for config in ipam.get("Config") or []:
+        if config.get("Subnet"):
+            args += ["--subnet", config["Subnet"]]
+        if config.get("IPRange"):
+            args += ["--ip-range", config["IPRange"]]
+        if config.get("Gateway"):
+            args += ["--gateway", config["Gateway"]]
+        for aux_key, aux_value in (config.get("AuxAddress") or {}).items():
+            args += ["--aux-address", f"{aux_key}={aux_value}"]
+
+    args.append(name)
+    note(f"creating network {name}")
+    docker(args, dry_run=dry_run)
+
+
+def restore_networks(manifest: dict[str, Any], dry_run: bool) -> None:
+    for network in manifest["objects"].get("networks") or []:
+        restore_network(network, dry_run)
+
+
+def volume_create_args(volume: dict[str, Any]) -> list[str]:
+    name = volume["Name"]
+    args = ["volume", "create", "--name", name]
+    if volume.get("Driver"):
+        args += ["--driver", volume["Driver"]]
+    for key, value in (volume.get("Labels") or {}).items():
+        args += ["--label", f"{key}={value}"]
+    for key, value in (volume.get("Options") or {}).items():
+        args += ["--opt", f"{key}={value}"]
+    return args
+
+
+def restore_volume(
+    bundle_dir: Path,
+    volume_entry: dict[str, Any],
+    helper_image: str,
+    no_pull: bool,
+    replace: bool,
+    yes: bool,
+    dry_run: bool,
+) -> None:
+    name = volume_entry["name"]
+    volume = volume_entry["inspect"]
+    existed = object_exists("volume", name)
+    if existed:
+        if not replace:
+            note(f"volume exists, skipping data restore: {name}")
+            return
+        if not confirm(f"Remove existing volume and restore archive data: {name}?", yes):
+            raise MigrationError(f"refusing to replace volume without confirmation: {name}")
+        note(f"removing existing volume {name}")
+        docker(["volume", "rm", name], dry_run=dry_run)
+
+    note(f"creating volume {name}")
+    docker(volume_create_args(volume), dry_run=dry_run)
+
+    if not dry_run:
+        ensure_helper_image(helper_image, no_pull)
+    volume_file = Path(volume_entry["file"]).name
+    volumes_dir = (bundle_dir / "volumes").resolve()
+    note(f"restoring volume data {name}")
+    docker(
+        [
+            "run",
+            "--rm",
+            "-v",
+            f"{name}:/to",
+            "-v",
+            f"{volumes_dir}:/backup:ro",
+            helper_image,
+            "sh",
+            "-c",
+            f"cd /to && tar xpf /backup/{shlex.quote(volume_file)}",
+        ],
+        dry_run=dry_run,
+    )
+
+
+def restore_volumes(
+    bundle_dir: Path,
+    manifest: dict[str, Any],
+    helper_image: str,
+    no_pull: bool,
+    replace: bool,
+    yes: bool,
+    dry_run: bool,
+) -> None:
+    volumes = manifest["objects"].get("volumes") or []
+    if volumes and not dry_run:
+        ensure_helper_image(helper_image, no_pull)
+    for volume in volumes:
+        restore_volume(bundle_dir, volume, helper_image, no_pull, replace, yes, dry_run)
+
+
+def add_if_value(args: list[str], flag: str, value: Any) -> None:
+    if value not in (None, "", [], {}):
+        args += [flag, str(value)]
+
+
+def restart_policy_arg(policy: dict[str, Any] | None) -> str | None:
+    if not policy:
+        return None
+    name = policy.get("Name")
+    if not name or name == "no":
+        return None
+    if name == "on-failure" and policy.get("MaximumRetryCount"):
+        return f"{name}:{policy['MaximumRetryCount']}"
+    return name
+
+
+def mount_spec(mount: dict[str, Any]) -> str | None:
+    mount_type = mount.get("Type")
+    destination = mount.get("Destination")
+    if not mount_type or not destination:
+        return None
+    if mount_type == "volume":
+        source = mount.get("Name") or mount.get("Source")
+        if not source:
+            return None
+        parts = [f"type=volume", f"source={source}", f"target={destination}"]
+    elif mount_type == "bind":
+        source = mount.get("Source")
+        if not source:
+            return None
+        parts = [f"type=bind", f"source={source}", f"target={destination}"]
+        if mount.get("Propagation"):
+            parts.append(f"bind-propagation={mount['Propagation']}")
+    else:
+        return None
+
+    if mount.get("RW") is False:
+        parts.append("readonly")
+    return ",".join(parts)
+
+
+def add_port_bindings(args: list[str], host_config: dict[str, Any]) -> None:
+    for container_port, bindings in (host_config.get("PortBindings") or {}).items():
+        if not bindings:
+            args += ["--publish", container_port]
+            continue
+        for binding in bindings:
+            host_ip = binding.get("HostIp") or ""
+            host_port = binding.get("HostPort") or ""
+            if host_ip and host_port:
+                spec = f"{host_ip}:{host_port}:{container_port}"
+            elif host_port:
+                spec = f"{host_port}:{container_port}"
+            else:
+                spec = container_port
+            args += ["--publish", spec]
+
+
+def add_host_config_args(args: list[str], host_config: dict[str, Any]) -> None:
+    restart = restart_policy_arg(host_config.get("RestartPolicy"))
+    if restart:
+        args += ["--restart", restart]
+    if host_config.get("Privileged"):
+        args.append("--privileged")
+    if host_config.get("ReadonlyRootfs"):
+        args.append("--read-only")
+    if host_config.get("Init"):
+        args.append("--init")
+
+    for value in host_config.get("CapAdd") or []:
+        args += ["--cap-add", value]
+    for value in host_config.get("CapDrop") or []:
+        args += ["--cap-drop", value]
+    for value in host_config.get("GroupAdd") or []:
+        args += ["--group-add", value]
+    for value in host_config.get("SecurityOpt") or []:
+        args += ["--security-opt", value]
+    for value in host_config.get("ExtraHosts") or []:
+        args += ["--add-host", value]
+    for value in host_config.get("Dns") or []:
+        args += ["--dns", value]
+    for value in host_config.get("DnsSearch") or []:
+        args += ["--dns-search", value]
+    for value in host_config.get("DnsOptions") or []:
+        args += ["--dns-option", value]
+
+    add_if_value(args, "--memory", host_config.get("Memory"))
+    add_if_value(args, "--memory-swap", host_config.get("MemorySwap"))
+    add_if_value(args, "--cpu-shares", host_config.get("CpuShares"))
+    if host_config.get("NanoCpus"):
+        args += ["--cpus", str(float(host_config["NanoCpus"]) / 1_000_000_000)]
+
+    for device in host_config.get("Devices") or []:
+        path_on_host = device.get("PathOnHost")
+        path_in_container = device.get("PathInContainer")
+        permissions = device.get("CgroupPermissions")
+        if path_on_host and path_in_container:
+            spec = f"{path_on_host}:{path_in_container}"
+            if permissions:
+                spec += f":{permissions}"
+            args += ["--device", spec]
+
+    for ulimit in host_config.get("Ulimits") or []:
+        name = ulimit.get("Name")
+        soft = ulimit.get("Soft")
+        hard = ulimit.get("Hard")
+        if name and soft is not None and hard is not None:
+            args += ["--ulimit", f"{name}={soft}:{hard}"]
+
+    for target, options in (host_config.get("Tmpfs") or {}).items():
+        args += ["--tmpfs", f"{target}:{options}" if options else target]
+
+    add_port_bindings(args, host_config)
+
+
+def add_config_args(args: list[str], config: dict[str, Any], container_id: str) -> None:
+    hostname = config.get("Hostname")
+    if hostname and hostname != container_id[:12]:
+        args += ["--hostname", hostname]
+    add_if_value(args, "--domainname", config.get("Domainname"))
+    add_if_value(args, "--user", config.get("User"))
+    add_if_value(args, "--workdir", config.get("WorkingDir"))
+
+    if config.get("Tty"):
+        args.append("--tty")
+    if config.get("OpenStdin"):
+        args.append("--interactive")
+
+    for env_value in config.get("Env") or []:
+        args += ["--env", env_value]
+    for key, value in (config.get("Labels") or {}).items():
+        args += ["--label", f"{key}={value}"]
+
+
+def network_mode_for_create(host_config: dict[str, Any]) -> str:
+    mode = host_config.get("NetworkMode") or "default"
+    if mode in {"host", "none"} or str(mode).startswith("container:"):
+        return mode
+    return "none"
+
+
+def cmd_tail_from_config(config: dict[str, Any]) -> tuple[list[str], list[str]]:
+    entrypoint = config.get("Entrypoint")
+    cmd = config.get("Cmd")
+    create_args: list[str] = []
+    tail: list[str] = []
+
+    if isinstance(entrypoint, list) and entrypoint:
+        create_args += ["--entrypoint", str(entrypoint[0])]
+        tail.extend(str(part) for part in entrypoint[1:])
+    elif isinstance(entrypoint, str) and entrypoint:
+        create_args += ["--entrypoint", entrypoint]
+
+    if isinstance(cmd, list):
+        tail.extend(str(part) for part in cmd)
+    elif isinstance(cmd, str) and cmd:
+        tail.append(cmd)
+
+    return create_args, tail
+
+
+def create_container_args(container: dict[str, Any]) -> list[str]:
+    name = container_name(container)
+    config = container.get("Config") or {}
+    host_config = container.get("HostConfig") or {}
+    container_id = container.get("Id", "")
+    image = container_image_ref(container)
+
+    if not image:
+        raise MigrationError(f"container has no image reference: {name}")
+
+    args = ["container", "create", "--name", name]
+    add_config_args(args, config, container_id)
+    add_host_config_args(args, host_config)
+
+    for mount in container.get("Mounts") or []:
+        spec = mount_spec(mount)
+        if spec:
+            args += ["--mount", spec]
+
+    args += ["--network", network_mode_for_create(host_config)]
+    entrypoint_args, command_tail = cmd_tail_from_config(config)
+    args.extend(entrypoint_args)
+    args.append(image)
+    args.extend(command_tail)
+    return args
+
+
+def connect_networks(container: dict[str, Any], name: str, dry_run: bool) -> None:
+    host_config = container.get("HostConfig") or {}
+    mode = host_config.get("NetworkMode") or "default"
+    if mode in {"host", "none"} or str(mode).startswith("container:"):
+        return
+
+    networks = ((container.get("NetworkSettings") or {}).get("Networks") or {})
+    container_id = container.get("Id", "")
+    short_id = container_id[:12]
+    for network_name, endpoint in networks.items():
+        if network_name == "none":
+            continue
+        args = ["network", "connect"]
+        if endpoint.get("IPAddress"):
+            args += ["--ip", endpoint["IPAddress"]]
+        if endpoint.get("GlobalIPv6Address"):
+            args += ["--ip6", endpoint["GlobalIPv6Address"]]
+        for alias in endpoint.get("Aliases") or []:
+            if alias and alias not in {name, short_id, container_id}:
+                args += ["--alias", alias]
+        args += [network_name, name]
+        note(f"connecting {name} to network {network_name}")
+        docker(args, dry_run=dry_run)
+
+
+def restore_container(container: dict[str, Any], replace: bool, yes: bool, start: bool, dry_run: bool) -> None:
+    name = container_name(container)
+    existed = object_exists("container", name)
+    if existed:
+        if not replace:
+            note(f"container exists, skipping: {name}")
+            return
+        if not confirm(f"Remove existing container and recreate it: {name}?", yes):
+            raise MigrationError(f"refusing to replace container without confirmation: {name}")
+        note(f"removing existing container {name}")
+        docker(["rm", "-f", name], dry_run=dry_run)
+
+    note(f"creating container {name}")
+    docker(create_container_args(container), dry_run=dry_run)
+    connect_networks(container, name, dry_run)
+
+    was_running = (container.get("State") or {}).get("Running")
+    if start and was_running:
+        note(f"starting container {name}")
+        docker(["start", name], dry_run=dry_run)
+
+
+def restore_containers(manifest: dict[str, Any], replace: bool, yes: bool, start: bool, dry_run: bool) -> None:
+    for container in manifest["objects"].get("containers") or []:
+        restore_container(container, replace, yes, start, dry_run)
+
+
+def restore(args: argparse.Namespace) -> None:
+    ensure_docker_ready()
+    temp: tempfile.TemporaryDirectory[str] | None = None
+    if args.file:
+        bundle_dir, temp = extract_bundle(Path(args.file).expanduser().resolve())
+    else:
+        bundle_dir = Path(args.bundle).expanduser().resolve()
+
+    try:
+        manifest = load_manifest(bundle_dir)
+        for warning in manifest.get("warnings") or []:
+            warn(warning.get("message", str(warning)))
+
+        if not args.skip_images:
+            restore_images(bundle_dir, manifest, args.dry_run)
+        if not args.skip_networks:
+            restore_networks(manifest, args.dry_run)
+        if not args.skip_volumes:
+            restore_volumes(
+                bundle_dir,
+                manifest,
+                args.helper_image,
+                args.no_pull_helper,
+                args.replace,
+                args.yes,
+                args.dry_run,
+            )
+        if not args.skip_containers:
+            restore_containers(manifest, args.replace, args.yes, args.start, args.dry_run)
+        note("restore complete")
+    finally:
+        if temp and not args.keep_extracted:
+            temp.cleanup()
+
+
+def print_table(title: str, rows: list[tuple[str, str]]) -> None:
+    print()
+    print(title)
+    if not rows:
+        print("  (none)")
+        return
+    width = max(len(left) for left, _ in rows)
+    for left, right in rows:
+        print(f"  {left.ljust(width)}  {right}")
+
+
+def list_command(args: argparse.Namespace) -> None:
+    ensure_docker_ready()
+    data = {
+        "containers": list_containers(),
+        "images": list_images(),
+        "volumes": list_volumes(),
+        "networks": list_networks(),
+    }
+    if args.format == "json":
+        print(json.dumps(data, indent=2, sort_keys=True))
+        return
+
+    print_table("Containers", [(row.get("Names", ""), row.get("Status", "")) for row in data["containers"]])
+    print_table("Images", [(image_ref_from_row(row), row.get("Size", "")) for row in data["images"]])
+    print_table("Volumes", [(row.get("Name", ""), row.get("Driver", "")) for row in data["volumes"]])
+    print_table("Networks", [(row.get("Name", ""), row.get("Driver", "")) for row in data["networks"]])
+
+
+def remote_options(args: argparse.Namespace) -> list[str]:
+    options: list[str] = []
+    if getattr(args, "identity_file", None):
+        options += ["-i", args.identity_file]
+    for option in getattr(args, "ssh_option", None) or []:
+        options += ["-o", option]
+    return options
+
+
+def ssh(args: argparse.Namespace, target: str, command: str) -> None:
+    run(["ssh", *remote_options(args), target, command])
+
+
+def scp(args: argparse.Namespace, source: str, target: str) -> None:
+    run(["scp", *remote_options(args), source, target])
+
+
+def shell_join(parts: list[str]) -> str:
+    return shlex.join([str(part) for part in parts])
+
+
+def remote_prepare(args: argparse.Namespace, target: str, remote_dir: str) -> None:
+    ssh(args, target, f"mkdir -p {shlex.quote(remote_dir)} && chmod 700 {shlex.quote(remote_dir)}")
+
+
+def copy_script_to_remote(args: argparse.Namespace, target: str, remote_dir: str) -> str:
+    script_path = str(Path(__file__).resolve())
+    remote_script = f"{remote_dir}/docker-migrate"
+    scp(args, script_path, f"{target}:{remote_script}")
+    ssh(args, target, f"chmod +x {shlex.quote(remote_script)}")
+    return remote_script
+
+
+def add_remote_selection_args(target: list[str], args: argparse.Namespace) -> None:
+    if args.all:
+        target.append("--all")
+    if args.select:
+        target.append("--select")
+    for attr, flag in [
+        ("containers", "--containers"),
+        ("images", "--images"),
+        ("volumes", "--volumes"),
+        ("networks", "--networks"),
+    ]:
+        for value in getattr(args, attr, None) or []:
+            target += [flag, value]
+    if args.pause:
+        target.append("--pause")
+    target += ["--helper-image", args.helper_image]
+    if args.no_pull_helper:
+        target.append("--no-pull-helper")
+
+
+def migrate(args: argparse.Namespace) -> None:
+    require_command("ssh")
+    require_command("scp")
+    if args.source and args.select:
+        fail("--select is interactive and only supported when backup runs locally; use explicit selectors with --source")
+
+    archive_name = ensure_archive_name(args.archive_name)
+    remote_dir = args.remote_dir.rstrip("/")
+    target_archive = f"{remote_dir}/{archive_name}"
+
+    with tempfile.TemporaryDirectory(prefix="docker-migrate-control-") as temp_dir:
+        local_archive = Path(temp_dir) / archive_name
+
+        if args.source:
+            note(f"preparing source {args.source}")
+            remote_prepare(args, args.source, remote_dir)
+            source_script = copy_script_to_remote(args, args.source, remote_dir)
+            source_archive = f"{remote_dir}/{archive_name}"
+            backup_cmd = [
+                "python3",
+                source_script,
+                "backup",
+                "--output",
+                remote_dir,
+                "--archive-name",
+                archive_name,
+                "--overwrite",
+                "--yes",
+            ]
+            add_remote_selection_args(backup_cmd, args)
+            note(f"running backup on source {args.source}")
+            ssh(args, args.source, shell_join(backup_cmd))
+            scp(args, f"{args.source}:{source_archive}", str(local_archive))
+            if not args.keep_archive:
+                ssh(args, args.source, f"rm -f {shlex.quote(source_archive)} {shlex.quote(source_script)}")
+        else:
+            backup_args = argparse.Namespace(**vars(args))
+            backup_args.output = temp_dir
+            backup_args.archive_name = archive_name
+            backup_args.overwrite = True
+            backup_args.keep_bundle = False
+            backup_args.yes = True
+            note("running local backup")
+            created_archive = backup(backup_args)
+            if created_archive.resolve() != local_archive.resolve():
+                shutil.copyfile(created_archive, local_archive)
+
+        note(f"preparing target {args.target}")
+        remote_prepare(args, args.target, remote_dir)
+        target_script = copy_script_to_remote(args, args.target, remote_dir)
+        scp(args, str(local_archive), f"{args.target}:{target_archive}")
+
+        restore_cmd = [
+            "python3",
+            target_script,
+            "restore",
+            "--file",
+            target_archive,
+            "--yes",
+            "--helper-image",
+            args.helper_image,
+        ]
+        if args.replace:
+            restore_cmd.append("--replace")
+        if args.start:
+            restore_cmd.append("--start")
+        if args.no_pull_helper:
+            restore_cmd.append("--no-pull-helper")
+
+        note(f"running restore on target {args.target}")
+        ssh(args, args.target, shell_join(restore_cmd))
+        if not args.keep_archive:
+            ssh(args, args.target, f"rm -f {shlex.quote(target_archive)} {shlex.quote(target_script)}")
+
+    note("migration complete")
+
+
+def add_selection_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--all", action="store_true", help="migrate all containers, images, volumes, and custom networks")
+    parser.add_argument("--select", action="store_true", help="open an interactive selector")
+    parser.add_argument("--containers", action="append", help="comma-separated container names or IDs")
+    parser.add_argument("--images", action="append", help="comma-separated image refs or IDs")
+    parser.add_argument("--volumes", action="append", help="comma-separated volume names")
+    parser.add_argument("--networks", action="append", help="comma-separated custom network names")
+    parser.add_argument("--pause", action="store_true", help="pause selected running containers while archiving volumes")
+    parser.add_argument("--helper-image", default=DEFAULT_HELPER_IMAGE, help=f"helper image for volume tar operations (default: {DEFAULT_HELPER_IMAGE})")
+    parser.add_argument("--no-pull-helper", action="store_true", help="do not pull the helper image automatically")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="docker-migrate",
+        description="One-command Docker migration for Linux hosts.",
+    )
+    parser.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    list_parser = subparsers.add_parser("list", help="list Docker objects on this host")
+    list_parser.add_argument("--format", choices=["table", "json"], default="table")
+    list_parser.set_defaults(func=list_command)
+
+    backup_parser = subparsers.add_parser("backup", help="create a migration archive on this host")
+    add_selection_arguments(backup_parser)
+    backup_parser.add_argument("--output", default=".", help="output directory")
+    backup_parser.add_argument("--archive-name", help="archive file name")
+    backup_parser.add_argument("--overwrite", action="store_true", help="overwrite an existing archive/bundle")
+    backup_parser.add_argument("--keep-bundle", action="store_true", help="keep the expanded bundle directory")
+    backup_parser.add_argument("--yes", action="store_true", help="assume yes for prompts")
+    backup_parser.set_defaults(func=backup)
+
+    restore_parser = subparsers.add_parser("restore", help="restore a migration archive on this host")
+    source = restore_parser.add_mutually_exclusive_group(required=True)
+    source.add_argument("--file", help="migration archive file")
+    source.add_argument("--bundle", help="expanded bundle directory")
+    restore_parser.add_argument("--replace", action="store_true", help="replace existing containers and volumes")
+    restore_parser.add_argument("--start", action="store_true", help="start containers that were running on the source host")
+    restore_parser.add_argument("--skip-images", action="store_true")
+    restore_parser.add_argument("--skip-networks", action="store_true")
+    restore_parser.add_argument("--skip-volumes", action="store_true")
+    restore_parser.add_argument("--skip-containers", action="store_true")
+    restore_parser.add_argument("--helper-image", default=DEFAULT_HELPER_IMAGE)
+    restore_parser.add_argument("--no-pull-helper", action="store_true")
+    restore_parser.add_argument("--dry-run", action="store_true", help="print Docker commands without mutating")
+    restore_parser.add_argument("--keep-extracted", action="store_true", help="keep temporary extracted archive contents")
+    restore_parser.add_argument("--yes", action="store_true", help="assume yes for destructive prompts")
+    restore_parser.set_defaults(func=restore)
+
+    migrate_parser = subparsers.add_parser("migrate", help="backup, transfer, and restore in one command")
+    add_selection_arguments(migrate_parser)
+    migrate_parser.add_argument("--source", help="optional source SSH host; omit when running on the old machine")
+    migrate_parser.add_argument("--target", required=True, help="target SSH host")
+    migrate_parser.add_argument("--remote-dir", default=DEFAULT_REMOTE_DIR, help=f"remote temp directory (default: {DEFAULT_REMOTE_DIR})")
+    migrate_parser.add_argument("--archive-name", help="archive name used during transfer")
+    migrate_parser.add_argument("--replace", action="store_true", help="replace existing containers and volumes on target")
+    migrate_parser.add_argument("--start", action="store_true", help="start containers that were running on the source host")
+    migrate_parser.add_argument("--keep-archive", action="store_true", help="keep remote archive and helper script after migration")
+    migrate_parser.add_argument("-i", "--identity-file", help="SSH identity file")
+    migrate_parser.add_argument("--ssh-option", action="append", help="extra SSH/SCP option, for example StrictHostKeyChecking=no")
+    migrate_parser.set_defaults(func=migrate)
+
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    try:
+        result = args.func(args)
+        if isinstance(result, Path):
+            print(result)
+        return 0
+    except KeyboardInterrupt:
+        fail("interrupted", code=130)
+    except MigrationError as exc:
+        fail(str(exc))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
